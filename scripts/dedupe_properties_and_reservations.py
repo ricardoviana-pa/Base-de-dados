@@ -109,6 +109,82 @@ def _do_property_merge(cur, canonical_id: str, victim_id: str) -> None:
     cur.execute("DELETE FROM properties WHERE id = %s::uuid", (victim_id,))
 
 
+def strip_bogus_guesty_ids(conn, log) -> int:
+    """Remove Airbnb-pattern values stored on properties.guesty_id by an early
+    bug in import_guesty.py (it was using `platform_id` — the channel reservation
+    ID — instead of a true Guesty property ID). Real Guesty property IDs are
+    24-char hex; Airbnb reservation IDs match `^HM[A-Z0-9]{8}$`.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE properties SET guesty_id = NULL
+            WHERE guesty_id ~ '^HM[A-Z0-9]{8}$'
+        """)
+        return cur.rowcount
+
+
+def merge_legacy_via_distinctive_tokens(conn, log) -> int:
+    """Phase 1c — merge Doc Único legacy properties into their current-portfolio
+    equivalents using distinctive-token matching.
+
+    Doc Único uses long descriptive names ("Portugal Active Cabedelo Beach Lodge")
+    while RR/Guesty use short tagged forms ("T7-Cabedelo Lodge"). After stripping
+    common stop-words (lodge/beach/house/etc.), pairs that share at least one
+    distinctive token AND have the same tipologia + bedrooms are very likely the
+    same physical house. Best-match per Doc Único property by shared-token count
+    (ties broken by trigram similarity).
+    """
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        cur.execute("""
+            WITH stopwords AS (
+                SELECT unnest(ARRAY[
+                    'portugal','active','lodge','beach','house','flat','retreat','duplex',
+                    'heated','pool','farm','agroturismo','with','for','the','and','near',
+                    'city','from','que','apartamento','apartment','quinta','vintage','manor',
+                    'view','green','sunset','river','ocean','valley','ridge','hill','garden',
+                    'mountain','village','stone','stars','yellow','blue','white','red','rose',
+                    'central','seaside','center','centro','dunes','door','street'
+                ]) AS w
+            ),
+            d AS (
+                SELECT id, canonical_name, tipologia, bedrooms,
+                       array(SELECT DISTINCT t FROM regexp_split_to_table(
+                              lower(regexp_replace(canonical_name, '[^a-zA-Z0-9 ]', ' ', 'g')),
+                              '\s+') AS t
+                           WHERE length(t) >= 4 AND t NOT IN (SELECT w FROM stopwords)) AS tokens
+                FROM properties
+                WHERE doc_unico_id IS NOT NULL AND guesty_id IS NULL AND rental_ready_id IS NULL
+            ),
+            g AS (
+                SELECT id, canonical_name, tipologia, bedrooms,
+                       array(SELECT DISTINCT t FROM regexp_split_to_table(
+                              lower(regexp_replace(canonical_name, '[^a-zA-Z0-9 ]', ' ', 'g')),
+                              '\s+') AS t
+                           WHERE length(t) >= 4 AND t NOT IN (SELECT w FROM stopwords)) AS tokens
+                FROM properties
+                WHERE (guesty_id IS NOT NULL OR rental_ready_id IS NOT NULL)
+                  AND doc_unico_id IS NULL
+            ),
+            ranked AS (
+                SELECT d.id AS doc_id, g.id AS new_id,
+                       ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY
+                           array_length(array(SELECT x FROM unnest(d.tokens) x WHERE x = ANY(g.tokens)), 1) DESC,
+                           similarity(d.canonical_name, g.canonical_name) DESC) AS rn
+                FROM d JOIN g
+                  ON d.tipologia = g.tipologia
+                 AND d.bedrooms = g.bedrooms
+                 AND d.tokens && g.tokens
+            )
+            SELECT doc_id, new_id FROM ranked WHERE rn = 1
+        """)
+        pairs = cur.fetchall()
+
+        for doc_id, new_id in pairs:
+            _do_property_merge(cur, canonical_id=str(new_id), victim_id=str(doc_id))
+        return len(pairs)
+
+
 def merge_via_shared_reservations(conn, log) -> int:
     """Phase 1b — discover same-house pairs by reservation overlap.
 
@@ -255,6 +331,10 @@ def main() -> int:
     log = setup_logging("dedupe")
     conn = connect()
     try:
+        log.info("Step 0: Strip bogus Airbnb-pattern guesty_id values (Sprint 1 bug fixup)")
+        stripped = strip_bogus_guesty_ids(conn, log)
+        log.info(f"  → {stripped} bogus guesty_id values cleared")
+
         log.info("Step 1a: Merge duplicate properties by canonical name key")
         merged_a = merge_properties(conn, log)
         log.info(f"  → {merged_a} merged via name canonicalisation")
@@ -262,6 +342,10 @@ def main() -> int:
         log.info("Step 1b: Merge same-house pairs discovered by shared reservations")
         merged_b = merge_via_shared_reservations(conn, log)
         log.info(f"  → {merged_b} merged via reservation overlap")
+
+        log.info("Step 1c: Merge Doc Único legacy properties via distinctive tokens")
+        merged_c = merge_legacy_via_distinctive_tokens(conn, log)
+        log.info(f"  → {merged_c} merged via Doc Único ↔ Guesty/RR token match")
 
         log.info("Step 2: Supersede duplicate reservations across sources")
         superseded = supersede_duplicate_reservations(conn, log)

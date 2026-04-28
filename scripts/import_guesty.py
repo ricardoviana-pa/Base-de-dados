@@ -150,12 +150,12 @@ def main() -> int:
                 # Sprint 6's live Guesty API will populate guest_id with full guest data.
                 guest_uuid = None
 
-                # Set guesty_id on property if missing (helps Sprint 6 live sync)
-                if platform_id and platform_id != "–":
-                    cur.execute(
-                        "UPDATE properties SET guesty_id = COALESCE(guesty_id, %s) WHERE id = %s",
-                        (platform_id, property_uuid),
-                    )
+                # Note: 'platform_id' is the Airbnb/Booking RESERVATION ID (e.g. 'HM5NW4P8PK'),
+                # not the Guesty PROPERTY ID. Storing it on properties.guesty_id was a Sprint 1
+                # bug that caused dedupe to skip pairs like 'Portugal Active Cabedelo Beach Lodge'
+                # ↔ 'T7-Cabedelo Lodge'. Real Guesty property IDs (hex hashes) only arrive in
+                # Sprint 6 via the live API. Until then, the COMISSÕES seeder stores the
+                # canonical property NAME in guesty_id as a placeholder marker.
 
                 cur.execute(
                     """
