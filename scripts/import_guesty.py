@@ -166,7 +166,8 @@ def main() -> int:
                     ON CONFLICT (source_system, source_id) DO UPDATE SET
                         property_id = EXCLUDED.property_id,
                         guest_id = COALESCE(reservations.guest_id, EXCLUDED.guest_id),
-                        channel = EXCLUDED.channel
+                        channel = EXCLUDED.channel,
+                        booked_at = EXCLUDED.booked_at
                     RETURNING id, (xmax = 0) AS is_insert
                     """,
                     (entity_id, SOURCE_SYSTEM, guesty_id, property_uuid, guest_uuid,

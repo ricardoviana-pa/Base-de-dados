@@ -117,6 +117,24 @@ def to_int(value: Any) -> Optional[int]:
         return None
 
 
+# Excel stores dates as serial numbers: days since 1899-12-30 (the day-0 base
+# accounting for the 1900 leap-year bug in Excel). Sane bounds: 1 (≈1900-01-01)
+# to ~80_000 (≈2119). The Guesty Export sheet is a real-world example: its
+# 'Created at' column comes through as an int because the column is typed
+# Number rather than Date in the workbook.
+_EXCEL_EPOCH = datetime(1899, 12, 30)
+from datetime import timedelta as _td
+
+
+def _excel_serial_to_dt(n: float) -> Optional[datetime]:
+    if not (1 < n < 100_000):
+        return None
+    try:
+        return _EXCEL_EPOCH + _td(days=float(n))
+    except (OverflowError, ValueError):
+        return None
+
+
 def to_date(value: Any) -> Optional[date]:
     if value is None or value == "":
         return None
@@ -124,6 +142,9 @@ def to_date(value: Any) -> Optional[date]:
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        dt = _excel_serial_to_dt(float(value))
+        return dt.date() if dt else None
     s = str(value).strip()
     if not s:
         return None
@@ -142,6 +163,8 @@ def to_datetime(value: Any) -> Optional[datetime]:
         return value
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _excel_serial_to_dt(float(value))
     s = str(value).strip()
     if not s:
         return None
