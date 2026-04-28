@@ -26,6 +26,51 @@ from common.logging_utils import setup_logging
 
 
 SQL_BLOCKS = [
+    ("Reclassify properties.status from reservation activity", """
+        WITH activity AS (
+            SELECT
+                p.id AS property_id,
+                MAX(EXTRACT(YEAR FROM rs.checkin_date)) FILTER (WHERE rs.status IN ('CONFIRMED','COMPLETED'))::INT
+                    AS last_year,
+                COUNT(*) FILTER (WHERE rs.status IN ('CONFIRMED','COMPLETED')) AS n_resv,
+                MAX(rs.checkout_date) FILTER (WHERE rs.status IN ('CONFIRMED','COMPLETED')) AS last_checkout
+            FROM properties p
+            LEFT JOIN reservations r ON r.property_id = p.id
+            LEFT JOIN reservation_states rs ON rs.reservation_id = r.id AND rs.effective_to IS NULL
+            GROUP BY p.id
+        )
+        UPDATE properties p SET
+            status = (CASE
+                -- Moimenta da Beira (cost_centers 0052-0062 marked 'saiu')
+                WHEN p.canonical_name ILIKE '%moimenta%'
+                  OR p.canonical_name ILIKE '%-MB'
+                  OR p.canonical_name ILIKE '%_Moimenta%' THEN 'OFFBOARDED'
+                -- Active iff has 2026 confirmed reservations
+                WHEN a.last_year >= 2026 THEN 'ACTIVE'
+                -- Had 2025 reservations but no 2026 ones — paused (temporary)
+                WHEN a.last_year = 2025 THEN 'PAUSED'
+                -- Only legacy ≤2024 reservations — left the portfolio
+                WHEN a.last_year IS NOT NULL AND a.last_year <= 2024 THEN 'OFFBOARDED'
+                -- 0 confirmed reservations but in current Guesty/RR catalog — coming soon
+                WHEN a.n_resv = 0 AND (p.guesty_id IS NOT NULL OR p.rental_ready_id IS NOT NULL)
+                    THEN 'ONBOARDING'
+                ELSE 'OFFBOARDED'
+            END)::property_status,
+            offboarded_at = CASE
+                WHEN (CASE
+                    WHEN p.canonical_name ILIKE '%moimenta%' OR p.canonical_name ILIKE '%-MB' OR p.canonical_name ILIKE '%_Moimenta%' THEN 'OFFBOARDED'
+                    WHEN a.last_year >= 2026 THEN 'ACTIVE'
+                    WHEN a.last_year = 2025 THEN 'PAUSED'
+                    WHEN a.last_year IS NOT NULL AND a.last_year <= 2024 THEN 'OFFBOARDED'
+                    WHEN a.n_resv = 0 AND (p.guesty_id IS NOT NULL OR p.rental_ready_id IS NOT NULL) THEN 'ONBOARDING'
+                    ELSE 'OFFBOARDED'
+                END) = 'OFFBOARDED' THEN COALESCE(p.offboarded_at, a.last_checkout, CURRENT_DATE)
+                ELSE NULL
+            END
+        FROM activity a
+        WHERE a.property_id = p.id
+    """),
+
     ("Backfill reservation_states financial split", """
         UPDATE reservation_states SET
           net_stay = gross_total - COALESCE(vat_stay, 0) - COALESCE(cleaning_fee_gross, 0),
