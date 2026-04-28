@@ -51,12 +51,14 @@ python3 -m venv .venv
 Os scripts têm dependências de FK. Correr nesta ordem:
 
 ```bash
-.venv/bin/python scripts/import_cost_centers.py        # 1º — sem FK
-.venv/bin/python scripts/import_cleaning_catalog.py    # 2º — sem FK
-.venv/bin/python scripts/import_doc_unico.py           # 3º — cria properties + owners + contracts
-.venv/bin/python scripts/import_excel_rr.py            # 4º — depende de properties
-.venv/bin/python scripts/import_guesty.py              # 5º — depende de properties
-.venv/bin/python scripts/import_budget_2026.py         # 6º — depende de properties (placeholders OK)
+.venv/bin/python scripts/import_cost_centers.py                         # 1º — sem FK
+.venv/bin/python scripts/import_cleaning_catalog.py                     # 2º — sem FK
+.venv/bin/python scripts/import_doc_unico.py                            # 3º — cria properties + owners + contracts
+.venv/bin/python scripts/import_excel_rr.py                             # 4º — depende de properties
+.venv/bin/python scripts/import_guesty.py                               # 5º — depende de properties
+.venv/bin/python scripts/import_budget_2026.py                          # 6º — depende de properties (placeholders OK)
+.venv/bin/python scripts/dedupe_properties_and_reservations.py          # 7º — funde dupes RR↔Guesty
+.venv/bin/python scripts/post_import_enrich.py                          # 8º — financial split, cleaning costs, links
 ```
 
 Cada script:
@@ -126,29 +128,59 @@ DELETE FROM cleanings;
 
 ## Resultado do primeiro run completo (28-04-2026)
 
-Após 1ª execução + recuperação de orfãos via COMISSÕES seeder:
+Após 1ª execução + recuperação de orfãos via COMISSÕES seeder + dedupe cross-source:
 
 | Tabela | Rows | Notas |
 |---|---:|---|
 | entities | 1 | RTV |
 | cost_centers | 74 | 17 inativos (offboarded), 54 ativos |
-| properties | 201 | 45 do Doc Único, 69 novos via COMISSÕES (RR), 87 novos via COMISSÕES (Guesty) |
+| properties | 130 | Após dedupe (de 201 iniciais → 29 nome-canonical → 40 reservation-overlap → 130 únicas, 83 com RR+Guesty IDs) |
 | owners | 109 | 45 placeholders Doc Único + 64 reais (do COMISSÕES) |
-| owner_contracts | 262 | 90 históricos (2020-2024) + 172 atuais (2025+) |
+| owner_contracts | 250 | 90 históricos (2020-2024) + 160 atuais (2025+) (após dedupe) |
 | guests | 1 340 | Apenas com email (1 046 sem email skipados) |
-| **reservations** | **6 780** | doc_unico 2 063 + rental_ready 2 510 + guesty 2 207 |
+| **reservations** | **6 780** | header rows preservadas (audit completo) |
+| **reservation_states current** | **5 614** | Apenas estados não-superseded — 1 162+3 RR superseded por Guesty |
 | reservation_states | 8 143 | Inclui re-runs (estado fechado + novo) |
 | cleanings / laundry / property_expenses | 1 577 / 151 / 874 | Doc Único 2020-2024 |
 | experience_bookings | 345 | 13 categorias seed |
 | budget_lines_property / company | 1 452 / 732 | BUD2026_v1 status DRAFT |
 | audit_log | 1 025 | Triggers a funcionar |
 
-**`v_otb_vs_stly` ao vivo:**
-- OTB 2026: **€825 167** (596 reservas)
-- OTB STLY 2025: **€1 190 513** (678 reservas)
-- BOB futuro: **€1 099 257**
+**Confirmed reservations 2026 (após dedupe):** 477 reservas / **€835 044**
+- Guesty (PMS oficial): 428 / €771 620
+- Rental Ready apenas (sem equivalente Guesty): 49 / €63 424 — provavelmente reservas Booking/Airbnb que não estavam no snapshot Excel Guesty
 
-**Orphans residuais:** 3 reservas Guesty (de 2 211) — Sprint 2 desambigua manualmente.
+**`v_otb_vs_stly` ao vivo (após dedupe):**
+- OTB 2026 (booked até hoje, checkin 2026): €287 789 (334 reservas)
+- OTB STLY 2025 (booked à mesma data ano passado): €499 955 (361 reservas)
+- BOB futuro: €667 852
+
+**Orphans residuais:** 3 reservas Guesty (de 2 207) — Sprint 2 desambigua manualmente.
+
+## Sobre dupla contagem cross-source (importante)
+
+O brief avisava: "uma reserva pode existir tanto no Rental Ready como no Guesty
+(período de overlap)". Esses dois sistemas duplicavam reservas (RR é accounting
+derivado do Guesty PMS), inflacionando o gross 2026 de **€835k → €1.37M** se
+não fossem deduplicadas.
+
+A solução implementada:
+1. **`scripts/dedupe_properties_and_reservations.py`** — fundir properties que
+   se referem à mesma casa física em fontes diferentes (29 via nome canónico
+   + 40 via overlap de reservas com mesma data + gross±10%).
+2. Para reservas que partilhem `(property_id, checkin, checkout)` entre fontes,
+   o estado da versão **Rental Ready é marcado superseded** (`effective_to=NOW()`)
+   e a versão **Guesty fica como atual** (PMS é canónico). A reserva header
+   permanece para audit; só o estado atual fica "fechado". Um evento
+   `NOTE_ADDED` regista a supersedence.
+
+**Como correr:** depois de `import_excel_rr.py` + `import_guesty.py`, sempre:
+```bash
+.venv/bin/python scripts/dedupe_properties_and_reservations.py
+.venv/bin/python scripts/post_import_enrich.py
+```
+
+Para a sequência completa, ver "Ordem de execução" no início.
 
 ## Limitações conhecidas (Sprint 1 → 2 backlog)
 
