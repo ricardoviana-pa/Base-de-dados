@@ -26,3 +26,7 @@ listings_export.csv
 reservations_export.csv
 guesty_screenshots/
 pa-dashboard-dist/
+
+# Sprint briefs (operational docs, not code)
+*_Brief.docx
+*_BRIEF_*.docx
