@@ -1,0 +1,27 @@
+.env
+.env.local
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.idea/
+.vscode/
+logs/*.log
+logs/*.json
+source_data/*.xlsx
+source_data/*.xlsm
+source_data/*.xls
+*.tar.gz
+
+# Sprint 0 artefacts that don't belong in this repo
+# (credentials live elsewhere; auditoria + exports are operational, not code)
+Supabase_Sprint0_Credenciais.md
+Pipedrive_Export_Sprint0.md
+01_BRIEF_COWORK_SPRINT_0.md
+Auditoria_Dashboard_Revenue_PA.docx
+guesty_analytics_snapshot.md
+listings_export.csv
+reservations_export.csv
+guesty_screenshots/
