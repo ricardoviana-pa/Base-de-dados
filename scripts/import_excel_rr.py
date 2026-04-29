@@ -181,22 +181,27 @@ def main() -> int:
                     (property_label, property_uuid),
                 )
 
-                # Upsert reservation
+                # RR is the BASE LAYER for 2023-2025. Insert as authoritative
+                # (source_system='rental_ready', source_id=rr_id), and also stamp
+                # the rr_source_id cross-reference column. Doc Único / Guesty
+                # imports later will MATCH against these rows and enrich the
+                # other source_id columns rather than creating duplicates.
                 cur.execute(
                     """
                     INSERT INTO reservations (
-                        entity_id, source_system, source_id, property_id, guest_id,
-                        channel, booked_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        entity_id, source_system, source_id, rr_source_id,
+                        property_id, guest_id, channel, booked_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (source_system, source_id) DO UPDATE SET
                         property_id = EXCLUDED.property_id,
+                        rr_source_id = EXCLUDED.rr_source_id,
                         guest_id = COALESCE(reservations.guest_id, EXCLUDED.guest_id),
                         channel = EXCLUDED.channel,
                         booked_at = EXCLUDED.booked_at
                     RETURNING id, (xmax = 0) AS is_insert
                     """,
-                    (entity_id, SOURCE_SYSTEM, rr_id, property_uuid, guest_uuid,
-                     channel, created_at),
+                    (entity_id, SOURCE_SYSTEM, rr_id, rr_id,
+                     property_uuid, guest_uuid, channel, created_at),
                 )
                 res = cur.fetchone()
                 reservation_id = str(res[0])

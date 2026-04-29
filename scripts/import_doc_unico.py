@@ -306,7 +306,7 @@ def process_inout_lodges(
     def col(name: str) -> Optional[int]:
         return headers.get(name)
 
-    inserted_resv = updated_resv = skipped = orphans = 0
+    inserted_resv = matched_to_rr = updated_resv = skipped = orphans = 0
 
     with conn.cursor() as cur:
         for row in iter_data_rows(sheet, header_row=header_row):
@@ -367,29 +367,64 @@ def process_inout_lodges(
             r = cur.fetchone()
             pa_rate = r[0] if r else Decimal("0.40")  # fallback
 
-            # Upsert reservation header
+            # MATCH-FIRST: try to find an existing RR reservation for the same
+            # physical stay (property + checkin±1d + checkout±1d). If found,
+            # ENRICH that row with doc_unico_source_id and skip creating a new
+            # one (no double-counting). Otherwise INSERT as a Doc-Único-only
+            # row (typical for 2020-2022 stays which predate the RR Excel).
             cur.execute(
                 """
-                INSERT INTO reservations (
-                    entity_id, source_system, source_id, property_id, guest_id,
-                    channel, booked_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (source_system, source_id) DO UPDATE SET
-                    property_id = EXCLUDED.property_id,
-                    guest_id = COALESCE(reservations.guest_id, EXCLUDED.guest_id),
-                    channel = EXCLUDED.channel,
-                    booked_at = EXCLUDED.booked_at
-                RETURNING id, (xmax = 0) AS is_insert
+                SELECT r.id FROM reservations r
+                JOIN reservation_states rs ON rs.reservation_id = r.id AND rs.effective_to IS NULL
+                WHERE r.property_id = %s
+                  AND ABS(rs.checkin_date - %s::date)  <= 1
+                  AND ABS(rs.checkout_date - %s::date) <= 1
+                  AND r.doc_unico_source_id IS NULL
+                LIMIT 1
                 """,
-                (entity_id, SOURCE_SYSTEM, booking_no, property_uuid, guest_uuid,
-                 channel, booked_at),
+                (property_uuid, checkin, checkout),
             )
-            res = cur.fetchone()
-            reservation_id = str(res[0])
-            if res[1]:
-                inserted_resv += 1
+            match = cur.fetchone()
+
+            if match:
+                reservation_id = str(match[0])
+                cur.execute(
+                    """
+                    UPDATE reservations SET
+                        doc_unico_source_id = %s,
+                        guest_id = COALESCE(guest_id, %s)
+                    WHERE id = %s
+                    """,
+                    (booking_no, guest_uuid, reservation_id),
+                )
+                matched_to_rr += 1
+                # Don't insert a new state — RR's state is already current and
+                # authoritative for 2023-2025. We only enrich the master row.
+                continue
             else:
-                updated_resv += 1
+                cur.execute(
+                    """
+                    INSERT INTO reservations (
+                        entity_id, source_system, source_id, doc_unico_source_id,
+                        property_id, guest_id, channel, booked_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (source_system, source_id) DO UPDATE SET
+                        property_id = EXCLUDED.property_id,
+                        doc_unico_source_id = EXCLUDED.doc_unico_source_id,
+                        guest_id = COALESCE(reservations.guest_id, EXCLUDED.guest_id),
+                        channel = EXCLUDED.channel,
+                        booked_at = EXCLUDED.booked_at
+                    RETURNING id, (xmax = 0) AS is_insert
+                    """,
+                    (entity_id, SOURCE_SYSTEM, booking_no, booking_no,
+                     property_uuid, guest_uuid, channel, booked_at),
+                )
+                res = cur.fetchone()
+                reservation_id = str(res[0])
+                if res[1]:
+                    inserted_resv += 1
+                else:
+                    updated_resv += 1
 
             # Build raw payload for state
             raw = {
@@ -439,10 +474,10 @@ def process_inout_lodges(
             )
 
     log.info(
-        f"  → reservations: inserted={inserted_resv} updated={updated_resv} "
-        f"skipped={skipped} orphans={orphans}"
+        f"  → reservations: inserted_new={inserted_resv} matched_to_rr={matched_to_rr} "
+        f"updated_existing={updated_resv} skipped={skipped} orphans={orphans}"
     )
-    return inserted_resv + updated_resv
+    return inserted_resv + matched_to_rr + updated_resv
 
 
 # ─────────────────────────── CLEAN ───────────────────────────

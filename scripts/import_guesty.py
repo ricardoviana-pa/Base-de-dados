@@ -96,7 +96,7 @@ def main() -> int:
         def col(name: str) -> Optional[int]:
             return headers.get(name)
 
-        inserted = updated = skipped = orphans = 0
+        inserted = matched_to_existing = updated = skipped = orphans = pre2026 = 0
 
         with conn.cursor() as cur:
             for row in iter_data_rows(sheet, header_row=1):
@@ -121,6 +121,13 @@ def main() -> int:
 
                 if not guesty_id or not checkin or not checkout:
                     skipped += 1
+                    continue
+
+                # Guesty went live in 2026. Anything with checkin <2026 in this
+                # Excel is manual backfill — known to be inflated and is not
+                # authoritative. Skip; RR is the truth for those years.
+                if checkin.year < 2026:
+                    pre2026 += 1
                     continue
 
                 property_uuid = resolver.resolve(property_label or "")
@@ -157,21 +164,56 @@ def main() -> int:
                 # Sprint 6 via the live API. Until then, the COMISSÕES seeder stores the
                 # canonical property NAME in guesty_id as a placeholder marker.
 
+                # MATCH-FIRST: try to find an existing master row (e.g. an RR
+                # reservation that's also in the Guesty Excel due to migration).
+                # Match by property + checkin±1d + checkout±1d. If found, ENRICH
+                # with guesty_source_id; do NOT overwrite source_system (which
+                # would be set to the era-canonical = 'guesty' anyway via the
+                # plain insert path below).
+                cur.execute(
+                    """
+                    SELECT r.id FROM reservations r
+                    JOIN reservation_states rs ON rs.reservation_id = r.id AND rs.effective_to IS NULL
+                    WHERE r.property_id = %s
+                      AND ABS(rs.checkin_date - %s::date)  <= 1
+                      AND ABS(rs.checkout_date - %s::date) <= 1
+                      AND r.guesty_source_id IS NULL
+                    LIMIT 1
+                    """,
+                    (property_uuid, checkin, checkout),
+                )
+                match = cur.fetchone()
+                if match:
+                    reservation_id = str(match[0])
+                    cur.execute(
+                        """
+                        UPDATE reservations SET
+                            guesty_source_id = %s,
+                            channel = COALESCE(channel, %s),
+                            booked_at = LEAST(booked_at, %s)
+                        WHERE id = %s
+                        """,
+                        (guesty_id, channel, created_at, reservation_id),
+                    )
+                    matched_to_existing += 1
+                    continue
+
                 cur.execute(
                     """
                     INSERT INTO reservations (
-                        entity_id, source_system, source_id, property_id, guest_id,
-                        channel, booked_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        entity_id, source_system, source_id, guesty_source_id,
+                        property_id, guest_id, channel, booked_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (source_system, source_id) DO UPDATE SET
                         property_id = EXCLUDED.property_id,
+                        guesty_source_id = EXCLUDED.guesty_source_id,
                         guest_id = COALESCE(reservations.guest_id, EXCLUDED.guest_id),
                         channel = EXCLUDED.channel,
                         booked_at = EXCLUDED.booked_at
                     RETURNING id, (xmax = 0) AS is_insert
                     """,
-                    (entity_id, SOURCE_SYSTEM, guesty_id, property_uuid, guest_uuid,
-                     channel, created_at),
+                    (entity_id, SOURCE_SYSTEM, guesty_id, guesty_id,
+                     property_uuid, guest_uuid, channel, created_at),
                 )
                 res = cur.fetchone()
                 reservation_id = str(res[0])
@@ -226,7 +268,9 @@ def main() -> int:
 
         after_resv = count_rows(conn, "reservations", "source_system = 'guesty'")
         log.info(f"reservations (guesty) after: {after_resv} (+{after_resv - before_resv})")
-        log.info(f"  inserted={inserted} updated={updated} skipped={skipped} orphans={orphans}")
+        log.info(f"  inserted_new={inserted} matched_to_existing={matched_to_existing} "
+                 f"updated_existing={updated} skipped={skipped} orphans={orphans} "
+                 f"pre2026_skipped={pre2026}")
         return 0
     except Exception as exc:
         conn.rollback()
