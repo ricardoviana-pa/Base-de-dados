@@ -278,7 +278,17 @@ def merge_properties(conn, log) -> int:
 
 def supersede_duplicate_reservations(conn, log) -> int:
     """Find pairs of reservations sharing (property_id, checkin, checkout) but
-    different source_system, and close the current state on the non-Guesty side.
+    different source_system, and close the current state on the non-canonical side.
+
+    Canonical source by era:
+      • 2026 onwards : Guesty (PMS in production since 2026)
+      • 2023-2025    : Rental Ready (PMS in production until end-2025;
+                       any Guesty rows in this window are manual backfill —
+                       known to be inflated)
+      • Anything else / older : Doc Único
+
+    Both 2025 and 2026 errors stem from blindly preferring Guesty across all
+    eras (which dragged the bad backfill into "current"). This rule fixes it.
     """
     with conn.cursor() as cur:
         cur.execute("""
@@ -287,11 +297,24 @@ def supersede_duplicate_reservations(conn, log) -> int:
                        rs.id AS state_id, rs.checkin_date, rs.checkout_date,
                        ROW_NUMBER() OVER (
                            PARTITION BY r.property_id, rs.checkin_date, rs.checkout_date
-                           ORDER BY CASE r.source_system
-                               WHEN 'guesty' THEN 1
-                               WHEN 'rental_ready' THEN 2
-                               WHEN 'doc_unico' THEN 3
-                           END
+                           ORDER BY
+                             -- Era-aware preference: pre-2026 RR-first, 2026+ Guesty-first
+                             CASE
+                               WHEN EXTRACT(YEAR FROM rs.checkin_date) < 2026 THEN
+                                 CASE r.source_system
+                                   WHEN 'rental_ready' THEN 1
+                                   WHEN 'guesty'       THEN 2
+                                   WHEN 'doc_unico'    THEN 3
+                                   ELSE 9
+                                 END
+                               ELSE
+                                 CASE r.source_system
+                                   WHEN 'guesty'       THEN 1
+                                   WHEN 'rental_ready' THEN 2
+                                   WHEN 'doc_unico'    THEN 3
+                                   ELSE 9
+                                 END
+                             END
                        ) AS rn,
                        COUNT(*) OVER (
                            PARTITION BY r.property_id, rs.checkin_date, rs.checkout_date
@@ -320,11 +343,100 @@ def supersede_duplicate_reservations(conn, log) -> int:
             INSERT INTO reservation_events (
                 reservation_id, event_type, event_at, source_system, triggered_by, details
             ) VALUES (%s, 'NOTE_ADDED', NOW(), %s, 'DEDUPE_SCRIPT',
-                     '{"reason": "superseded_by_canonical_source", "canonical": "guesty"}'::jsonb)
+                     '{"reason": "superseded_by_era_canonical_source"}'::jsonb)
             """,
             [(v[0], v[1]) for v in victims],
         )
         return len(victims)
+
+
+def realign_canonical_states_to_era_rule(conn, log) -> tuple[int, int]:
+    """Atomic 2-pass realignment after the supersedence rule changes:
+      1. Compute, per (property, checkin, checkout) group, the canonical
+         reservation_id under the era-aware rule.
+      2. CLOSE the current state of any reservation in that group whose id
+         is NOT the canonical (set effective_to=NOW() on every effective_to
+         IS NULL row that doesn't belong to the canonical reservation).
+      3. OPEN the latest state of the canonical reservation if it has none
+         currently open (set effective_to=NULL on the most recent state row).
+
+    Returns (closed, opened).
+
+    Done in this order so the partial unique index `idx_states_one_current`
+    (one effective_to-IS-NULL per reservation) is never violated.
+    """
+    with conn.cursor() as cur:
+        # 1. Compute canonical reservation_id per group
+        cur.execute("""
+            CREATE TEMP TABLE _canonical_per_group ON COMMIT DROP AS
+            WITH all_states AS (
+                SELECT r.id AS reservation_id, r.source_system, r.property_id,
+                       rs.checkin_date, rs.checkout_date,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY r.property_id, rs.checkin_date, rs.checkout_date
+                           ORDER BY
+                             CASE
+                               WHEN EXTRACT(YEAR FROM rs.checkin_date) < 2026 THEN
+                                 CASE r.source_system
+                                   WHEN 'rental_ready' THEN 1
+                                   WHEN 'guesty'       THEN 2
+                                   WHEN 'doc_unico'    THEN 3
+                                   ELSE 9
+                                 END
+                               ELSE
+                                 CASE r.source_system
+                                   WHEN 'guesty'       THEN 1
+                                   WHEN 'rental_ready' THEN 2
+                                   WHEN 'doc_unico'    THEN 3
+                                   ELSE 9
+                                 END
+                             END
+                       ) AS rn
+                FROM reservations r
+                JOIN reservation_states rs ON rs.reservation_id = r.id
+                WHERE rs.status IN ('CONFIRMED', 'COMPLETED')
+            )
+            SELECT reservation_id AS canonical_reservation_id, property_id, checkin_date, checkout_date
+            FROM all_states WHERE rn = 1
+        """)
+
+        # 2. CLOSE any currently-open state whose reservation isn't the canonical for its group
+        cur.execute("""
+            UPDATE reservation_states rs SET effective_to = NOW()
+            WHERE rs.effective_to IS NULL
+              AND rs.status IN ('CONFIRMED', 'COMPLETED')
+              AND EXISTS (
+                  SELECT 1 FROM reservations r
+                  JOIN _canonical_per_group g
+                    ON g.property_id = r.property_id
+                   AND g.checkin_date = rs.checkin_date
+                   AND g.checkout_date = rs.checkout_date
+                  WHERE r.id = rs.reservation_id
+                    AND g.canonical_reservation_id <> r.id
+              )
+        """)
+        closed = cur.rowcount
+
+        # 3. OPEN the most-recent state of each canonical reservation that no longer has a current one
+        cur.execute("""
+            WITH targets AS (
+                SELECT g.canonical_reservation_id AS rid,
+                       (SELECT id FROM reservation_states
+                        WHERE reservation_id = g.canonical_reservation_id
+                        ORDER BY effective_from DESC LIMIT 1) AS latest_state_id
+                FROM _canonical_per_group g
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM reservation_states rs
+                    WHERE rs.reservation_id = g.canonical_reservation_id
+                      AND rs.effective_to IS NULL
+                )
+            )
+            UPDATE reservation_states rs SET effective_to = NULL
+            FROM targets t
+            WHERE rs.id = t.latest_state_id
+        """)
+        opened = cur.rowcount
+        return closed, opened
 
 
 def main() -> int:
@@ -347,7 +459,11 @@ def main() -> int:
         merged_c = merge_legacy_via_distinctive_tokens(conn, log)
         log.info(f"  → {merged_c} merged via Doc Único ↔ Guesty/RR token match")
 
-        log.info("Step 2: Supersede duplicate reservations across sources")
+        log.info("Step 2: Re-align current states to era-aware canonical rule (2-pass: close-then-open)")
+        closed, opened = realign_canonical_states_to_era_rule(conn, log)
+        log.info(f"  → closed {closed} non-canonical current states, opened {opened} canonical states")
+
+        log.info("Step 3: Supersede any remaining duplicate currents (defensive — should be 0 after step 2)")
         superseded = supersede_duplicate_reservations(conn, log)
         log.info(f"  → {superseded} reservation states marked superseded")
 

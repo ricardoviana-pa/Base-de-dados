@@ -122,6 +122,23 @@ def main() -> int:
                 liquid = to_decimal(get_cell(row, col("Rendimento líquido") or 16))
                 nights = to_int(get_cell(row, col("Número de noites") or 17))
                 adults = to_int(get_cell(row, col("Número de adultos") or 18))
+                children = to_int(get_cell(row, col("Número de crianças") or 19))
+                # IMPORTANT: column meanings in this RR Excel template (verified 29-04-2026):
+                #   col 20 'Taxas de limpeza'   = cleaning COST (paid to the cleaning team).
+                #                                  Stored as a negative number — this is an
+                #                                  expense, not revenue. Goes to raw_payload
+                #                                  for now (proper home is `cleanings.cost_gross`).
+                #   col 21 'Renda de limpeza'   = cleaning REVENUE (charged to the guest).
+                #                                  This is the field that matches Looker's
+                #                                  "Cleaning fees ~€123k 2025". 100% PA revenue
+                #                                  per RM confirmation.
+                cleaning_fee_gross = to_decimal(get_cell(row, col("Renda de limpeza") or 21))
+                cleaning_cost_paid = to_decimal(get_cell(row, col("Taxas de limpeza") or 20))
+                tourist_tax        = to_decimal(get_cell(row, col("Taxa turística") or 22))
+                platform_fees      = to_decimal(get_cell(row, col("Taxas de plataforma") or 23))
+                payment_fee        = to_decimal(get_cell(row, col("Taxa de pagamento") or 24))
+                expected_amount    = to_decimal(get_cell(row, col("Valor Esperado") or 25))
+                paid_amount        = to_decimal(get_cell(row, col("Valor Efetuado") or 26))
 
                 if not rr_id or not checkin or not checkout:
                     skipped += 1
@@ -198,19 +215,32 @@ def main() -> int:
                     "stay_value": float(stay_value) if stay_value else None,
                     "received": float(received) if received else None,
                     "liquid": float(liquid) if liquid else None,
+                    "gross_paid_inc_vat": float(gross_paid) if gross_paid else None,
+                    "cleaning_cost_paid": float(cleaning_cost_paid) if cleaning_cost_paid else None,
+                    "tourist_tax": float(tourist_tax) if tourist_tax else None,
+                    "platform_fees": float(platform_fees) if platform_fees else None,
+                    "payment_fee": float(payment_fee) if payment_fee else None,
+                    "expected_amount": float(expected_amount) if expected_amount else None,
+                    "paid_amount": float(paid_amount) if paid_amount else None,
                 }
 
                 cur.execute(
                     """
                     INSERT INTO reservation_states (
                         reservation_id, status, checkin_date, checkout_date,
-                        adults, gross_total, vat_stay,
+                        adults, children, gross_total, vat_stay,
+                        cleaning_fee_gross, cleaning_fee_net,
                         channel_commission, pa_commission_rate, effective_from,
                         source_system, raw_payload
-                    ) VALUES (%s, 'CONFIRMED', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ) VALUES (%s, 'CONFIRMED', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     """,
-                    (reservation_id, checkin, checkout, adults,
-                     gross_paid or stay_no_vat or 0, vat or 0,
+                    # gross_total uses 'TOTAL ESTADIA ANTES IVA' (stay_no_vat) to match
+                    # Looker / Guesty Live revenue definition (accommodation before VAT).
+                    # 'Total Pago Pelo Hóspede' (gross_paid) lives in raw_payload as a
+                    # secondary signal (it includes VAT + extras).
+                    (reservation_id, checkin, checkout, adults, children,
+                     stay_no_vat or gross_paid or 0, vat or 0,
+                     cleaning_fee_gross or 0, cleaning_fee_gross or 0,
                      abs(commission) if commission else 0, pa_rate, created_at,
                      SOURCE_SYSTEM, json.dumps(raw)),
                 )
