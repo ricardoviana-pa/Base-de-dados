@@ -33,6 +33,7 @@ from common.db import (
     connect, count_rows, find_source_file, get_entity_id,
     get_or_create_guest_by_email, upsert_owner, upsert_property_by_doc_unico,
 )
+from common.country_iso import to_iso as country_to_iso
 from common.excel_utils import (
     get_cell,
     iter_data_rows,
@@ -267,10 +268,14 @@ def process_client_info(conn, log, sheet) -> Dict[str, str]:
             continue
 
         full_name = " ".join(p for p in [name, surname] if p) or None
-        country_code = None
-        if country:
-            cc_guess = country.strip()[:2].upper() if len(country.strip()) <= 3 else None
-            country_code = cc_guess if cc_guess and cc_guess.isalpha() else None
+        # Use the ISO lookup (handles full names like "Germany" → "DE").
+        # The legacy try-first-2-chars heuristic was a bug — discarded any
+        # country name longer than 3 chars, leaving country_code NULL on
+        # 100% of records (verified against 1,103 Doc Único clients).
+        country_code = country_to_iso(country)
+        # Drop obvious noise values for city
+        if city and city.strip() in ('-', '.', '..', '...'):
+            city = None
 
         guest_uuid = get_or_create_guest_by_email(
             conn, email=email, name=full_name, phone=phone,
