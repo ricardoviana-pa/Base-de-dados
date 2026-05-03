@@ -30,3 +30,13 @@ pa-dashboard-dist/
 # Sprint briefs (operational docs, not code)
 *_Brief.docx
 *_BRIEF_*.docx
+
+# Generated reports + raw data dumps (regenerable from DB / source)
+exports/*.xlsx
+exports/*.csv
+*.xlsx
+*.xlsm
+*.xls
+.~lock.*
+!scripts/**/*.py
+!migrations/**/*.sql
