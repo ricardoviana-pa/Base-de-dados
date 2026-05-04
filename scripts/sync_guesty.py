@@ -106,32 +106,63 @@ CHANNEL_MAP = {
 # ─── HTTP layer ────────────────────────────────────────────────────────────
 
 
+TOKEN_CACHE_PATH = Path("/tmp/guesty_token.json")
+
+
 class GuestyClient:
     def __init__(self, log):
         self.log = log
         self._token = None
         self._token_expires = 0
         self._session = requests.Session()
+        self._load_cached_token()
+
+    def _load_cached_token(self):
+        try:
+            if TOKEN_CACHE_PATH.exists():
+                data = json.loads(TOKEN_CACHE_PATH.read_text())
+                if data.get("expires_at", 0) > time.time() + 60:
+                    self._token = data["token"]
+                    self._token_expires = data["expires_at"]
+                    self.log.info(f"  Loaded cached OAuth token (expires in {int(self._token_expires - time.time())}s)")
+        except Exception as e:
+            self.log.warning(f"  Token cache load failed: {e}")
+
+    def _save_cached_token(self):
+        try:
+            TOKEN_CACHE_PATH.write_text(json.dumps({
+                "token": self._token, "expires_at": self._token_expires,
+            }))
+        except Exception:
+            pass
 
     def _get_token(self):
         if self._token and time.time() < self._token_expires - 60:
             return self._token
-        r = requests.post(
-            GUESTY_TOKEN_URL,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": os.environ["GUESTY_CLIENT_ID"],
-                "client_secret": os.environ["GUESTY_CLIENT_SECRET"],
-                "scope": "open-api",
-            },
-            timeout=20,
-        )
-        r.raise_for_status()
-        body = r.json()
-        self._token = body["access_token"]
-        self._token_expires = time.time() + int(body.get("expires_in", 3600))
-        self.log.info(f"  OAuth token acquired (expires_in={body.get('expires_in')}s)")
-        return self._token
+        for attempt in range(3):
+            r = requests.post(
+                GUESTY_TOKEN_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": os.environ["GUESTY_CLIENT_ID"],
+                    "client_secret": os.environ["GUESTY_CLIENT_SECRET"],
+                    "scope": "open-api",
+                },
+                timeout=20,
+            )
+            if r.status_code == 429:
+                wait = 30 * (2 ** attempt)  # 30, 60, 120
+                self.log.warning(f"  OAuth 429 — waiting {wait}s (attempt {attempt+1}/3)")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            body = r.json()
+            self._token = body["access_token"]
+            self._token_expires = time.time() + int(body.get("expires_in", 3600))
+            self.log.info(f"  OAuth token acquired (expires_in={body.get('expires_in')}s)")
+            self._save_cached_token()
+            return self._token
+        raise RuntimeError("OAuth 429 — esperar ~1h e tentar de novo")
 
     def get(self, path: str, params: dict | None = None) -> dict:
         url = f"{GUESTY_API_BASE}{path}"
