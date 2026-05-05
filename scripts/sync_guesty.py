@@ -24,9 +24,11 @@ What it does:
       • reservations row (source_system='guesty', source_id=Guesty _id,
                            guesty_source_id same)
       • reservation_states row with full money breakdown:
-          gross_total      = money.fareAccommodation
+          gross_total      = money.fareAccommodationAdjusted (real revenue incl.
+                             Airbnb smart-pricing; falls back to fareAccommodation)
           cleaning_fee_*   = money.fareCleaning
-          channel_commission = money.commission (or hostServiceFee)
+          channel_commission = money.hostServiceFee (portal fee charged to HOST;
+                             = 0 for Airbnb "Guest Only Fee" model)
           vat_stay         = derived (~6% of fareAccommodation)
       • reservation_events row (BOOKED) when first seen
       • guests row enriched with country/email/phone (the missing piece!)
@@ -384,18 +386,29 @@ def sync_reservations(client: GuestyClient, conn, log, since: Optional[str] = No
     skipped_unmapped = orphans = 0
     errors = []
 
-    params = {
-        "fields": ",".join([
-            "_id", "status", "confirmationCode", "source", "integration",
-            "listingId", "guestId", "guest", "checkIn", "checkOut", "nightsCount",
-            "guestsCount", "createdAt", "money",
-        ]),
-    }
+    # NOTE: Guesty API v1 list endpoint no longer returns full objects
+    # (money, status, source are missing). Strategy: fetch IDs from list,
+    # then GET /reservations/{id} individually for full data.
+    #
+    # IMPORTANT: Without a date filter, Guesty only returns ~200 recent
+    # reservations. Always add a checkIn filter to get all reservations.
+    list_filters = [{"field": "checkIn", "operator": "$gte", "value": "2024-01-01"}]
     if since:
-        params["filters"] = json.dumps([{"field": "lastUpdatedAt", "operator": "$gte", "value": since}])
+        list_filters.append({"field": "lastUpdatedAt", "operator": "$gte", "value": since})
+    list_params = {"filters": json.dumps(list_filters)}
 
     try:
-        for r in client.get_paginated("/reservations", params=params):
+        # Phase 2a: collect reservation IDs from paginated list
+        reservation_ids = []
+        for stub in client.get_paginated("/reservations", params=list_params):
+            rid = stub.get("_id")
+            if rid:
+                reservation_ids.append(rid)
+        log.info(f"  Collected {len(reservation_ids)} reservation IDs from list")
+
+        # Phase 2b: fetch full objects individually
+        for rid in reservation_ids:
+            r = client.get(f"/reservations/{rid}")
             fetched += 1
             try:
                 ok = process_reservation(r, conn, listing_map, entity_id, log)
@@ -496,9 +509,24 @@ def process_reservation(r: dict, conn, listing_map: dict, entity_id: str, log) -
     channel = map_channel(r.get("source"), r.get("integration"))
 
     money = r.get("money") or {}
-    gross_total      = to_decimal(money.get("fareAccommodation")) or Decimal("0")
+    # fareAccommodationAdjusted = real revenue (includes Airbnb smart-pricing
+    # adjustments); fareAccommodation = base price before adjustments.
+    fare_accom_raw   = to_decimal(money.get("fareAccommodation")) or Decimal("0")
+    fare_accom_adj   = to_decimal(money.get("fareAccommodationAdjusted"))
+    gross_total      = fare_accom_adj if fare_accom_adj and fare_accom_adj > 0 else fare_accom_raw
     cleaning_fee     = to_decimal(money.get("fareCleaning")) or Decimal("0")
-    channel_comm     = to_decimal(money.get("commission") or money.get("hostServiceFee")) or Decimal("0")
+    # money.hostServiceFee = channel commission (what the portal charges the HOST).
+    #   For Airbnb "Guest Only Fee" model: 0 (Airbnb charges guest, not host).
+    #   For Airbnb "Split Fee" / Booking.com: 3-18%.
+    # money.commission = PM management fee (Guesty's net-income share config).
+    #   NOT reliable for PA revenue — depends on Guesty config, not owner contracts.
+    channel_comm     = to_decimal(money.get("hostServiceFee")) or Decimal("0")
+    host_payout      = to_decimal(money.get("hostPayout")) or Decimal("0")
+    owner_revenue    = to_decimal(money.get("ownerRevenue")) or Decimal("0")
+    # Let the DB trigger calculate PA Revenue from owner_contracts rates.
+    # Guesty's money.commission uses its own net-income formula which doesn't
+    # match actual PA/Owner split contracts.
+    pa_revenue_from_guesty = None
     # Estimate VAT @ 6% of fare accommodation (Portuguese AL standard)
     vat_stay = (gross_total * Decimal("0.06")).quantize(Decimal("0.01"))
 
@@ -602,7 +630,12 @@ def process_reservation(r: dict, conn, listing_map: dict, entity_id: str, log) -
                 "guesty_source": r.get("source"),
                 "integration_platform": (r.get("integration") or {}).get("platform"),
                 "confirmation_code": r.get("confirmationCode"),
-                "host_payout": float(money.get("hostPayout") or 0),
+                "fare_accommodation": float(fare_accom_raw),
+                "fare_accommodation_adjusted": float(fare_accom_adj) if fare_accom_adj else None,
+                "host_service_fee": float(channel_comm),
+                "host_payout": float(host_payout),
+                "owner_revenue": float(owner_revenue),
+                "guesty_pm_commission": float(to_decimal(money.get("commission")) or 0),
                 "guests_count": r.get("guestsCount"),
                 "guesty_status_raw": r.get("status"),
             }
@@ -611,14 +644,15 @@ def process_reservation(r: dict, conn, listing_map: dict, entity_id: str, log) -
                 INSERT INTO reservation_states (
                     reservation_id, status, checkin_date, checkout_date,
                     gross_total, vat_stay, cleaning_fee_gross, cleaning_fee_net,
-                    channel_commission, pa_commission_rate,
+                    channel_commission, pa_commission_rate, pa_revenue_gross,
                     effective_from, source_system, raw_payload
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                 """,
                 (
                     reservation_id, status, to_date_str(checkin), to_date_str(checkout),
                     gross_total, vat_stay, cleaning_fee, cleaning_fee,
-                    channel_comm, pa_rate, booked_at, SOURCE_SYSTEM,
+                    channel_comm, pa_rate, pa_revenue_from_guesty,
+                    booked_at, SOURCE_SYSTEM,
                     json.dumps(raw),
                 ),
             )
@@ -701,7 +735,12 @@ def process_reservation(r: dict, conn, listing_map: dict, entity_id: str, log) -
             "guesty_source": r.get("source"),
             "integration_platform": (r.get("integration") or {}).get("platform"),
             "confirmation_code": r.get("confirmationCode"),
-            "host_payout": float(money.get("hostPayout") or 0),
+            "fare_accommodation": float(fare_accom_raw),
+            "fare_accommodation_adjusted": float(fare_accom_adj) if fare_accom_adj else None,
+            "host_service_fee": float(channel_comm),
+            "host_payout": float(host_payout),
+            "owner_revenue": float(owner_revenue),
+            "guesty_pm_commission": float(to_decimal(money.get("commission")) or 0),
             "net_income_formula": money.get("netIncomeFormula"),
             "guests_count": r.get("guestsCount"),
             "guesty_status_raw": r.get("status"),
@@ -712,14 +751,15 @@ def process_reservation(r: dict, conn, listing_map: dict, entity_id: str, log) -
             INSERT INTO reservation_states (
                 reservation_id, status, checkin_date, checkout_date,
                 gross_total, vat_stay, cleaning_fee_gross, cleaning_fee_net,
-                channel_commission, pa_commission_rate,
+                channel_commission, pa_commission_rate, pa_revenue_gross,
                 effective_from, source_system, raw_payload
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             """,
             (
                 reservation_id, status, to_date_str(checkin), to_date_str(checkout),
                 gross_total, vat_stay, cleaning_fee, cleaning_fee,
-                channel_comm, pa_rate, booked_at, SOURCE_SYSTEM,
+                channel_comm, pa_rate, pa_revenue_from_guesty,
+                booked_at, SOURCE_SYSTEM,
                 json.dumps(raw),
             ),
         )
