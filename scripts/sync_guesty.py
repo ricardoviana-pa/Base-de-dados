@@ -291,20 +291,27 @@ def sync_listings(client: GuestyClient, conn, log, auto_create: bool = True) -> 
 
             if property_id:
                 matched += 1
+                # Check if another property already owns this guesty_id
                 cur.execute(
-                    """
-                    UPDATE properties SET
-                        guesty_id = %s,
-                        bedrooms = COALESCE(bedrooms, %s),
-                        bathrooms = COALESCE(bathrooms, %s),
-                        max_guests = COALESCE(max_guests, %s),
-                        property_type = COALESCE(property_type, %s),
-                        city = COALESCE(city, %s)
-                    WHERE id = %s
-                      AND (guesty_id IS NULL OR guesty_id NOT SIMILAR TO '[a-f0-9]{24}')
-                    """,
-                    (gid, bedrooms, bathrooms, max_guests, ptype, city, property_id),
+                    "SELECT id FROM properties WHERE guesty_id = %s AND id != %s",
+                    (gid, property_id),
                 )
+                conflict_row = cur.fetchone()
+                if not conflict_row:
+                    cur.execute(
+                        """
+                        UPDATE properties SET
+                            guesty_id = %s,
+                            bedrooms = COALESCE(bedrooms, %s),
+                            bathrooms = COALESCE(bathrooms, %s),
+                            max_guests = COALESCE(max_guests, %s),
+                            property_type = COALESCE(property_type, %s),
+                            city = COALESCE(city, %s)
+                        WHERE id = %s
+                          AND (guesty_id IS NULL OR guesty_id NOT SIMILAR TO '[a-f0-9]{24}')
+                        """,
+                        (gid, bedrooms, bathrooms, max_guests, ptype, city, property_id),
+                    )
                 updated_existing_guesty += 1
             elif auto_create:
                 # Extract tipologia from name (regex T<N>)
